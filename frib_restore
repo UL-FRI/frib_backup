@@ -1,0 +1,358 @@
+#!/bin/dash
+
+###
+#
+#
+#
+###
+
+USAGE="Usage: frib_restore.sh [OPTION]... [snapshot_dir]
+Restore disk snapshot from directory.
+
+For each file in snapshot_dir ending in .zstd, try to find the appropriate
+device in /dev/disk/by-partuuid/, then overwrite the device.
+
+
+Options:  
+  --ptable                  Restore partitions from ptable.zip
+  --pprofile PROFILE        Specify profile for partition restore
+  --uuids UUID1,UUID2...    Only restore listed UUIDs
+  --expand                  Resize filesystems after restore
+  --gui                     Show a Dialog-based UI
+"
+
+FRIB_PARTITION=$( cd -P -- "$(dirname -- "$(command -v -- "$0")")" && pwd -P )/frib_partition
+RESIZEFS=$( cd -P -- "$(dirname -- "$(command -v -- "$0")")" && pwd -P )/frib_resizefs
+
+gui_sshot_dir(){
+    echo "Set dir"
+    NEW_SSHOT_DIR=$(dialog --dselect "${SSHOT_DIR}" 25 80  3>&1 1>&2 2>&3)
+    if [ $? = 0 ]
+    then
+        SSHOT_DIR=${NEW_SSHOT_DIR}
+        UUIDS=""
+    fi
+}
+
+gui_uuids(){
+    TAG_ITEM_STATE=""
+    for ssfile in "${SSHOT_DIR}"/*.zstd
+    do
+        uuid=$(basename "${ssfile}" .zstd)
+        DEVFILE="/dev/disk/by-partuuid/${uuid}" 
+    if [ -b "${DEVFILE}" ]
+    then
+        PART=$( basename $(readlink "${DEVFILE}" ) )
+        TAG_ITEM_STATE="${uuid} ${PART} on ${TAG_ITEM_STATE}"
+    fi
+    done
+    NEW_UUIDS=$(dialog --checklist "Select partition UUIDs"\
+                25 80 10\
+                ${TAG_ITEM_STATE}\
+                3>&1 1>&2 2>&3);
+    if [ $? = 0 ]
+    then
+        echo "NEW_UUIDS: $NEW_UUIDS"
+        UUIDS=$(echo $NEW_UUIDS | tr ' ' ',')
+        echo "$UUIDS: $UUIDS"
+    fi
+}
+
+gui_frib_ptable(){
+    # ret=$(dialog --msgbox "JUHUUUU" 20 80 3>&1 1>&2 2>&3)
+    if [ -z "${SSHOT_DIR}" ]
+    then
+        ret=$(dialog --msgbox "Select source dir first (${SSHOT_DIR})" 20 80 3>&1 1>&2 2>&3)
+    else
+        PARTBACKUP_FILE="${SSHOT_DIR}/ptable.zip" 
+        if [ -f "${PARTBACKUP_FILE}" ]
+        then
+            existing_profiles=$($FRIB_PARTITION list "${PARTBACKUP_FILE}")
+            if [ -z "${PARTBACKUP_PROFILE}" ]
+            then
+                default_profile=$($FRIB_PARTITION match "${PARTBACKUP_FILE}")
+            else
+                default_profile="${PARTBACKUP_PROFILE}"
+            fi
+        else
+            existing_profiles=""
+            default_profile="default"
+        fi
+        ret=$(dialog --inputbox "Profile (one of)\n${existing_profiles}" 20 80 "${default_profile}" 3>&1 1>&2 2>&3)
+        if [ ! -z "${ret}" ]
+        then
+            PARTBACKUP_PROFILE="${ret}"
+            partresult=$( $FRIB_PARTITION restore "${PARTBACKUP_FILE}" "${PARTBACKUP_PROFILE}" )
+            ret=$(dialog --msgbox "${partresult}" 20 80 3>&1 1>&2 2>&3)
+        fi
+    fi
+}
+
+gui_parts(){ 
+    ACTION=$(dialog --menu "Create partitions"\
+             20 80 10\
+             "Ptable" "Restore from ptable.zip"\
+             "gparted" "GUI for parted"\
+             "parted" "text-based GNU partition editor"\
+             3>&1 1>&2 2>&3)
+    if [ $? = 0 ]
+    then
+        case "${ACTION}" in
+            Ptable)
+                gui_frib_ptable
+            ;;
+            gparted)
+                gparted
+            ;;
+            parted)
+                parted
+            ;;
+        esac
+
+    fi
+}
+
+gui_fix_parts(){
+    while true
+    do
+        UUID_LIST=""
+        for uuid in $(lsblk -nlo TYPE,PARTUUID | grep "^part" | sed -e 's/^part //')
+        do
+            DEVFILE="/dev/disk/by-partuuid/${uuid}" 
+            if [ -b "${DEVFILE}" ]
+            then
+                PART=$(basename $(readlink "${DEVFILE}" ) )
+                UUID_LIST="${uuid} ${PART} ${UUID_LIST}"
+            fi
+        done
+        CHANGE_UUID=$(dialog --menu "Fix UUIDs\nMAP: ${UUID_MAP}" 20 80 10 ${UUID_LIST} 3>&1 1>&2 2>&3)
+        if [ $? = 0 ]
+        then
+            NEW_UUIDS=""
+            for ssfile in "${SSHOT_DIR}"/*.zstd
+            do
+                uuid=$(basename "${ssfile}" .zstd)
+                DEVFILE="/dev/disk/by-partuuid/${uuid}" 
+                if [ -b "${DEVFILE}" ]
+                then
+                    PART=$( basename $(readlink "${DEVFILE}" ) )
+                else
+                    PART="?"
+                fi
+                NEW_UUIDS="${uuid} ${PART} ${NEW_UUIDS}"
+            done
+            NEW_UUID=$(dialog --menu "SET UUID TO" 20 80 10 ${NEW_UUIDS} 3>&1 1>&2 2>&3)
+            if [ $? = 0 ]
+            then
+            echo "CHANGE UUID ${CHANGE_UUID} TO ${NEW_UUID}"
+        fi
+        else
+            break
+        fi
+    done
+}
+
+gui_restore(){
+    if [ -z "${UUIDS}" ]
+    then
+        ret=$(dialog --msgbox "Select UUIDs first!" 20 80 3>&1 1>&2 2>&3)
+    else
+        ret=$(dialog --msgbox "${UUIDS}" 20 80 3>&1 1>&2 2>&3)
+        IFS=","
+        for UUID in $UUIDS
+        do
+            PART=$(readlink -f "/dev/disk/by-partuuid/${UUID}")
+            SRCFILE="${SSHOT_DIR}/${UUID}.zstd"
+            if [ -b "${PART}" ] && [ -f "${SRCFILE}" ]
+            then
+                # zstd -d --no-sparse --force --progress "${SRCFILE}" -o "${PART}" 2>&1 | stdbuf -o0 tr '\r' '\n' | sed -u -e '/^ *$/d' -e 's/.*==> //' -e 's/% *$//' | dialog --gauge "Restoring ${SRCFILE} to ${PART}" 20 80
+                zstd -d --no-sparse --force --progress "${SRCFILE}" -o "${PART}" 2>&1 | dialog --progressbox "Restoring ${SRCFILE} to ${PART}" 20 80
+            else
+                PARTMSG="${PART} ${SRCFILE}"
+                if [ ! -b "${PART}" ]
+                then
+                    PARTMSG=", it is not a blockdevice "
+                fi
+                if [ ! -f "${SRCFILE}" ]
+                then
+                    PARTMSG=", the source is not a file"
+                fi
+                ret=$(dialog --infobox "NOT restoring ${UUID} ${PARTMSG}" 20 80 3>&1 1>&2 2>&3)
+                sleep 5
+            fi
+        done
+    fi
+}
+
+gui_expand(){
+    if [ -z "${UUIDS}" ]
+    then
+        ret=$(dialog --msgbox "Select UUIDs first!" 20 80 3>&1 1>&2 2>&3)
+    else
+        ret=$(dialog --msgbox "${UUIDS}" 20 80 3>&1 1>&2 2>&3)
+        IFS=","
+        for UUID in $UUIDS
+        do
+            PART=$(readlink -f "/dev/disk/by-partuuid/${UUID}")
+            $RESIZEFS "${PART}" | dialog --progressbox "Resizing ${PART}" 20 80
+        done
+    fi
+}
+
+
+
+restore(){
+    if [ -z "${UUIDS}" ]
+    then
+        echo "No UUIDs specified"
+    else
+        IFS=","
+        for UUID in $UUIDS
+        do
+            PART=$(readlink -f "/dev/disk/by-partuuid/${UUID}")
+            SRCFILE="${SSHOT_DIR}/${UUID}.zstd"
+            if [ -b "${PART}" ] && [ -f "${SRCFILE}" ]
+            then
+                zstd -d --no-sparse --force --progress "${SRCFILE}" -o "${PART}"
+            else
+                echo "NOT restoring ${UUID}"
+                sleep 5
+            fi
+        done
+    fi
+}
+
+gui(){
+    # bla=$(dialog --checklist "particije" 300 200 10 tag item on tag2 item2 off tag3 item3 on tag4 item4 on tag5 item5 on tag6 item6 true tag7 item7 1 3>&1 1>&2 2>&3); reset; echo $bla
+    # dialog ""
+    while true
+    do
+        ret=$(dialog --nook --menu "FRI Backup Restore (${SSHOT_DIR}: ${UUIDS})" 20 80 10\
+ "Dir" "Select snapshot directory"\
+ "Partitions" "Create partitions"\
+ "Select" "Select partitions to restore"\
+ "Restore" "Restore selected partitions"\
+ "Expand" "Resize filesystems on selected partitions"\
+ "Fix" "Fix / change partition UUIDs"\
+ "Quit" "Exit program" 3>&1 1>&2 2>&3)
+        case "${ret}" in
+            Dir)
+                gui_sshot_dir
+            ;;
+            Partitions)
+                gui_parts
+            ;;
+            Select)
+                gui_uuids
+            ;;
+            Restore)
+                gui_restore
+            ;;
+            Expand)
+                gui_expand
+            ;;
+            Fix)
+                gui_fix_parts
+            ;;
+            Quit)
+                break
+            ;;
+        esac
+    done
+}
+
+
+UUIDS=""
+SSHOT_DIR=""
+
+if [ "$#" -eq 0 ]
+then
+    echo "${USAGE}"
+    exit 1
+else
+    while [ "$#" -gt 0 ]
+    do
+        case "$1" in
+        --ptable)
+                DO_PTABLE="1"
+                shift 1
+            ;;
+        --pprofile)
+                PARTBACKUP_PROFILE="$2"
+                shift 2
+            ;;
+        --expand)
+                DO_RESIZEFS="1"
+                shift 1
+            ;;
+        --uuids)
+                UUIDS="$2"
+                shift 2
+            ;;
+        --gui)
+                shift 1
+                SHOW_GUI="tui"
+            ;;
+        --help)
+                echo "${USAGE}"
+                exit 1
+            ;;
+        *)
+            SSHOT_DIR="$1"
+            shift 1
+            ;;
+        esac
+    done
+fi
+
+echo ""
+if [ "${SHOW_GUI}" = "tui" ]
+then
+    if [ -z "${SSHOT_DIR}" ]
+    then
+        SSHOT_DIR=./
+    fi
+    gui
+    exit 0
+else
+    echo "SSHOT_DIR: ${SSHOT_DIR}"
+    if [ -z "${SSHOT_DIR}" ]
+    then
+        echo "${USAGE}"
+        exit 1
+    fi
+
+    # SSHOT_DIR=$1
+    if [ ! -z "${DO_PTABLE}" ]
+    then
+        PARTBACKUP_FILE="${SSHOT_DIR}/ptable.zip" 
+        $FRIB_PARTITION restore "${PARTBACKUP_FILE}" "${PARTBACKUP_PROFILE}"
+    fi
+
+    if [ -z "${UUIDS}" ]
+    then
+        for ssfile in "${SSHOT_DIR}"/*.zstd
+        do
+            uuid=$(basename "${ssfile}" .zstd)
+            if [ -z "${UUIDS}" ]
+            then
+                UUIDS="${uuid}"
+            else
+                UUIDS="${UUIDS},${uuid}"
+            fi
+        done
+    fi
+    echo "UUIDS: ${UUIDS}"
+
+    restore
+    if [ ! -z "${DO_RESIZEFS}" ]
+    then
+        IFS=","
+        for UUID in $UUIDS
+        do
+            PART=$(readlink -f "/dev/disk/by-partuuid/${UUID}")
+            $RESIZEFS "${PART}"
+        done
+    fi
+fi
+

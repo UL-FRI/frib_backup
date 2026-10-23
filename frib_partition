@@ -1,0 +1,343 @@
+#!/bin/dash
+
+###
+#
+#
+#
+###
+
+USAGE="Usage: $0 <command> <backupfile> [OPTION1] [OPTION2] ...
+
+Read/write partition configuration from backupfile.
+Semi-automatically partition different disks.
+
+A backup file is a simple zip file containing a subdirectory for each profile.
+
+A diskmap consists of pairs of disk names, separated by colons (:).
+
+Commands:
+  list <backupfile>                          List profiles in backup
+  vlist <backupfile>                         List profiles in backup - verbose
+  diskmap <backupfile> <profile>             Autocreate a diskmap
+  match <backupfile>                         Determine best-matching profile
+  backup <backupfile> <profile>              Backup all partiton tables
+  restore <backupfile> [profile] [diskmap]   Restore partitions
+  copy <backupfile> <profile> <new_profile> <diskmap>
+
+If the profile or diskmap is not specified for restore,
+use the result from match and diskmap.
+"
+
+# LSBLK_KEY_CMD="lsblk -b -d -n -Q PTTYPE==\"gpt\" -o SIZE,ROTA,TRAN,TYPE,NAME"
+LSBLK_KEY_CMD="lsblk -x SIZE -b -d -n -o SIZE,ROTA,TRAN,TYPE,NAME,PTTYPE"
+#LSBLK_KEY_CMD="lsblk -b -d -n -o SIZE,ROTA,TRAN,TYPE,NAME"
+
+cleanup(){
+    if [ ! -z "${FRIBTMP}" ]
+    then
+        rm -rf "${FRIBTMP}"
+    fi
+}
+
+trap cleanup EXIT
+
+list(){
+    for i in $(zipinfo -1 "${BACKUPFILE}" "*/sort_key.txt")
+    do
+        dirname -- "${i}"
+    done
+}
+
+vlist(){
+    for i in $(zipinfo -1 "${BACKUPFILE}" "*/sort_key.txt")
+    do
+        echo "${i}"
+        unzip -q -c "${BACKUPFILE}" "${i}"
+    done
+}
+
+diskmap(){
+    unzip -o -q "${BACKUPFILE}" "${BPROFILE}/sort_key.txt" -d "${FRIBTMP}"
+    # echo $LSBLK_KEY_CMD
+    # $LSBLK_KEY_CMD
+    # KEYSYSTEM=$($LSBLK_KEY_CMD | grep -e " gpt\$" -e " dos\$")
+    KEYSYSTEM=$($LSBLK_KEY_CMD | tac | grep " disk ")
+    #echo $KEYSYSTEM
+    # remove PTTYPE from KEYSYSTEM
+    KEYSYSTEM=$(echo "${KEYSYSTEM}" | sed -e "s/ gpt\$//" -e "s/ dos\$//")
+    KEYPROFILE=$(cat ${FRIBTMP}/${BPROFILE}/sort_key.txt)
+    # remove size from KEYPROFILE to get KEYLEVEL, replace spaces with comma
+    # KEYLEVEL=$(echo "${KEYPROFILE}" | sed -e "s/^ *[0-9]* *//" -e "s/  */,/g")
+    # remove size from KEYPROFILE to get KEYLEVEL, replace spaces with comma, remove parttype
+    KEYLEVEL=$(echo "${KEYPROFILE}" | sed -e "s/^ *[0-9]* *//" -e "s/  */,/g" -e "s/,gpt\$//" -e "s/,dos\$//")
+    # remove PTTYPE from KEYLEVEL
+    # KEYLEVEL=$(echo "${KEYLEVEL}" | sed -e "s/,*[^,]*\$//")
+    #echo "KEYPROFILE:${KEYPROFILE}"
+    #echo "KEYLEVEL:${KEYLEVEL}"
+    #echo "..."
+    #echo "KEYSYSTEM:${KEYSYSTEM}"
+    #echo "..."
+    LEVEL_RESULT=0
+    for level in NAME TYPE TRAN ROTA NONE
+    do
+        # echo "LEVEL: ${level}"
+        KEYS=$(echo "$KEYLEVEL" | sort | uniq)
+        if [ -z "${KEYS}" ]
+        then
+            KEYS='"'
+        fi
+        RESULT=""
+        size_sum=0
+        # echo "KEYS"
+        # echo "${KEYS}"
+        # echo "..."
+        for key in $KEYS
+        do
+            KEYFILTER=$(echo "$key" | sed -e "s/^/^ *[0-9]* */" -e "s/,/ */g" -e "s/\"//")
+            #echo "|${KEYFILTER}|"
+            DISKSSYSTEM=$(echo "${KEYSYSTEM}" | grep "${KEYFILTER} ")
+            DISKSPROFILE=$(echo "${KEYPROFILE}" | grep "${KEYFILTER} ")
+            #echo "${DISKSPROFILE}"
+            #echo "${DISKSSYSTEM}"
+            # first line, only first field before gpt (just size)
+            # echo "${DISKSSYSTEM}"
+            sizesystem=$(echo "${DISKSSYSTEM}" | sed -e "1s/ *\\([0-9]*\\).*/\\1/" -e "2,\$d")
+            # first line, only last field (just name)
+            namesystem=$(echo "${DISKSSYSTEM}" | sed -e "s/ *\$//" -e "1s/.* //" -e "2,\$d")
+            # ditto for DISKSPROFILE
+            sizeprofile=$(echo "${DISKSPROFILE}" | sed -e "1s/ *\\([0-9]*\\).*/\\1/" -e "2,\$d")
+            nameprofile=$(echo "${DISKSPROFILE}" | sed -e "1s/ *[^ ]*\$//" -e "1s/ *\$//" -e "1s/.* //" -e "2,\$d")
+            #echo "${level}: ${namesystem}, ${nameprofile}"
+            #echo "SYS: ${DISKSSYSTEM}"
+            #echo "PROF: ${DISKSPROFILE}"
+            # for each entry in the profile
+            while [ ! -z "${sizeprofile}" ]
+            do
+                if [ -z "${sizesystem}" ]
+                then
+                    # echo "NO SIZE1"
+                    RESULT=""
+                    break
+                fi
+                size_diff="$((${sizesystem}-${sizeprofile}))"
+                if [ "${size_diff}" -lt 0 ];
+                then
+                    # echo "INNER TOO SMALL"
+                    RESULT=""
+                    break
+                else
+                    # echo "RESULT: ${namesystem}:${nameprofile}: $size_diff"
+                    RESULT="${RESULT} ${namesystem}:${nameprofile}"
+                    size_sum=$((${size_sum}+${size_diff}))
+                fi
+                DISKSSYSTEM=$(echo "${DISKSSYSTEM}" | tail -n +2)
+                sizesystem=$(echo "${DISKSSYSTEM}" | sed -e "1s/ *\\([0-9]*\\).*/\\1/" -e "2,\$d")
+                namesystem=$(echo "${DISKSSYSTEM}" | sed -e "s/ *[^ ]*\$//" -e "s/ *\$//" -e "1s/.* //" -e "2,\$d")
+                DISKSPROFILE=$(echo "${DISKSPROFILE}" | tail -n +2)
+                sizeprofile=$(echo "${DISKSPROFILE}" | sed -e "1s/ *\\([0-9]*\\).*/\\1/" -e "2,\$d")
+                nameprofile=$(echo "${DISKSPROFILE}" | sed -e "s/ *[^ ]*\$//" -e "s/ *\$//" -e "1s/.* //" -e "2,\$d")
+            done
+            if [ -z "${RESULT}" ]
+            then
+                break
+            fi
+        done
+        if [ ! -z "${RESULT}" ]
+        then
+            echo "${RESULT}" | sed -e "s/^ *//"
+            echo "${level} ${LEVEL_RESULT} ${size_sum}" >&2
+            break
+        fi
+        # strip one level
+        LEVEL_RESULT="$((${LEVEL_RESULT}+1))"
+        KEYLEVEL=$(echo "${KEYLEVEL}" | sed -e "s/,*[^,]*\$//")
+    done
+    if [ -z "${RESULT}" ]
+    then
+        echo "NO_MATCH 10000 -1" >&2
+    fi
+}
+
+find_best_match(){
+    BESTLEVEL=""
+    BESTSIZE=""
+    unzip -o -q "${BACKUPFILE}" "*/sort_key.txt" -d "${FRIBTMP}"
+    KEYHERE=$($LSBLK_KEY_CMD | grep -e " gpt\$" -e " dos\$")
+    for profiledir in ${FRIBTMP}/*;
+    do
+        BPROFILE=$(basename "${profiledir}")
+        match=$({ diskmap > /dev/null; } 2>&1 )
+        level=$(echo "${match}" | cut -d " " -f 2)
+        sizediff=$(echo "${match}" | cut -d " " -f 3)
+        # echo "${match} -> (${level}, ${sizediff})"
+        if [ -z "${BESTLEVEL}" ] || [ ! "${BESTLEVEL}" -lt "${level}" ]
+        then
+            if [ ! -z "${BESTLEVEL}" ] && [ "${BESTLEVEL}" -gt "${level}" ]
+            then
+                BESTSIZE=""
+            fi
+            # echo "BESTIE?: ${BPROFILE} (${BESTLEVEL}, ${BESTSIZE})"
+            if [ -z "${BESTSIZE}" ] || [ "${BESTSIZE}" -gt "${sizediff}" ]
+            then
+                BESTLEVEL="${level}"
+                BESTSIZE="${sizediff}"
+                BESTMATCH="${BPROFILE}"
+                # echo "BESTIE: ${BPROFILE} (${BESTLEVEL}, ${BESTSIZE})"
+            fi
+        fi
+    done
+    if [ -z "{BESTMATCH}" ]
+    then
+        echo "No match!" >&2
+    else
+        echo "${BESTMATCH}"
+    fi
+}
+
+backup(){ 
+    BPROFILEDIR="${FRIBTMP}/${BPROFILE}"
+    mkdir "${BPROFILEDIR}"
+    lsblk -b -d -O > "${BPROFILEDIR}/lsblk.txt"
+    $LSBLK_KEY_CMD | tac | grep -e " gpt\$" -e " dos\$" > "${BPROFILEDIR}/sort_key.txt"
+    for dev in $(lsblk -n -d -o path)
+    do
+        fname="${BPROFILEDIR}/$(basename $dev).sf"
+        sfdisk -d $dev > "${fname}" || rm "${fname}"
+    done
+    cd ${FRIBTMP}
+    zip -u -r "${BACKUPFILE}" .
+}
+
+prepare_map(){
+    DEVICEMAP=$(diskmap 2> /dev/null)
+    for i in $*
+    do
+        disksystem=$(echo "${i}" | cut -d ":" -f 1)
+        diskprofile=$(echo "${i}" | cut -d ":" -f 2)
+        DEVICEMAP=$(echo "${DEVICEMAP}" | sed -e "s/[^ ]*:${diskprofile}//" -e "s/\$/ ${i}/")
+    done
+    DEVICEMAP=$(echo ${DEVICEMAP} | sed -e "s/^ *//")
+}
+
+remap(){
+    diskprofile=$1
+    echo "${DEVICEMAP}" | sed -e "s/.*${diskprofile}://" -e "s/ .*//"
+}
+
+copy_profile(){
+    unzip -o -q "${BACKUPFILE}" "${BPROFILE}/*" -d "${FRIBTMP}"
+    BPROFILEDIR="${FRIBTMP}/${BPROFILE}"
+    prepare_map $*
+    NEWPROFILEDIR="${FRIBTMP}/${NEWPROFILE}"
+    mkdir "${NEWPROFILEDIR}"
+    $LSBLK_KEY_CMD | grep -e " gpt\$" -e " dos\$" > "${NEWPROFILEDIR}/sort_key.txt"
+    lsblk -b -d -O > "${NEWPROFILEDIR}/lsblk.txt"
+    $LSBLK_KEY_CMD | > "${NEWPROFILEDIR}/sort_key.txt"
+    for fname in "${FRIBTMP}/${BPROFILE}/"*.sf
+    do
+        dev=$(remap $(basename $fname .sf) | sed "s/:.*//")
+        # cp "${fname}" "$NEWPROFILEDIR/${dev}.sf"
+        if [ ! -z "${dev}" ]
+        then 
+            cat "${fname}" | sed -e "/^last-lba: /d" -e "\$s/, *size= *[0-9]*,/,/" > "$NEWPROFILEDIR/${dev}.sf"
+        fi
+    done
+    cd ${FRIBTMP}
+    zip -u -r "${BACKUPFILE}" .
+}
+
+
+restore(){
+    unzip -o -q "${BACKUPFILE}" "${BPROFILE}/*" -d "${FRIBTMP}"
+    prepare_map $*
+    for fname in "${FRIBTMP}/${BPROFILE}/"*.sf
+    do
+        dev=$(remap $(basename $fname .sf) | sed "s/:.*//")
+        echo "${fname} -> ${dev}"
+        if [ ! -z "${dev}" ]
+        then 
+            cat "${fname}" | sed -e "/^last-lba: /d" -e "\$s/, *size= *[0-9]*,/,/" | sfdisk "/dev/${dev}"
+        fi
+    done
+}
+
+if [ "$#" -lt 2 ]
+then
+    echo "${USAGE}"
+    exit 1
+else
+    FRIBTMP=$(mktemp -d 2>/dev/null || mktemp -d -t 'fripartition')
+    while [ "$#" -gt 1 ]
+    do
+        case "$1" in
+            list)
+                BACKUPFILE=$(realpath $2)
+                shift 2
+                list
+            ;;
+            vlist)
+                BACKUPFILE=$(realpath $2)
+                shift 2
+                vlist
+            ;;
+            diskmap)
+                if [ "$#" -lt 3 ]
+                then
+                    echo "${USAGE}"
+                    exit 1
+                fi
+                BACKUPFILE=$(realpath $2)
+                BPROFILE=$3
+                shift 3
+                diskmap
+            ;;
+            match)
+                BACKUPFILE=$(realpath $2)
+                shift 2
+                find_best_match
+            ;;
+            backup)
+                if [ "$#" -lt 3 ]
+                then
+                    echo "${USAGE}"
+                    exit 1
+                fi
+                BACKUPFILE=$(realpath $2)
+                BPROFILE=$3
+                shift 3
+                backup
+            ;;
+            restore)
+                BACKUPFILE=$(realpath $2)
+                if [ "$#" -gt 2 ]
+                then
+                    BPROFILE=$3
+                    shift 3
+                else
+                    BPROFILE=$(find_best_match)
+                    shift 2
+                fi
+                restore $*
+                shift $#
+            ;;
+            copy)
+                if [ "$#" -lt 4 ]
+                then
+                    echo "${USAGE}"
+                    exit 1
+                fi
+                BACKUPFILE=$(realpath $2)
+                BPROFILE=$3
+                NEWPROFILE=$4
+                shift 4
+                copy_profile $*
+                shift $#
+            ;;
+            *)
+                echo "${USAGE}"
+                exit 1
+            ;;
+        esac
+    done
+fi
+

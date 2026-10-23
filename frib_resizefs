@@ -1,0 +1,52 @@
+#!/bin/bash
+
+USAGE="Usage: $0 DEVICE
+Resize filesystem.
+This is a simple wrapper for resize2fs, xfs_growfs, e.t.c.
+It uses lsblk to determine the filesystem type.
+
+Supported filesystems:
+   ntfs, ext2/3/4, reiser, xfs, ufs, FAT, btrfs 
+"
+
+if [ ! "$#" -eq 1 ]
+then
+    echo "${USAGE}"
+    exit 1
+fi
+
+dev=$1
+fstype=$(lsblk -d -n -o FSTYPE "${dev}")
+
+sync
+
+case $fstype in
+    ntfs)
+        echo "y" | ntfsresize -f $dev
+    ;;
+    ext*)
+	e2fsck -y -f $dev
+	resize2fs $dev
+    ;;
+    reiser*)
+	resize_reiserfs $dev
+    ;;
+    xfs)
+        xfs_growfs $dev
+    ;;
+    ufs)
+        growfs.ufs -y $dev
+    ;;
+    *fat*)
+        fatresize -s max $dev
+    ;;
+    btrfs)
+        TMPDIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'friresize')
+        mount $dev $TMPDIR
+        btrfs filesystem resize max $TMPDIR
+        umount $TMPDIR
+    ;;
+    *)
+        echo "$fstype not supported";
+    ;;
+esac
